@@ -1,5 +1,6 @@
 ---
 title: "Spotify song popularity analysis"
+subtitle: "Completed as part of the coursework for the Multivariate Analysis and Statistical Modelling module at the University of Brighton, 2025/26."
 author: "Gosia Szkatula"
 date: 06/10/2026
 format:
