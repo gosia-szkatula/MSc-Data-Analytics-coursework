@@ -1,0 +1,502 @@
+---
+title: "Spotify song popularity analysis"
+author: "Gosia Szkatula"
+date: 06/10/2026
+format:
+  my-assignment-pdf:
+    echo: true
+    df-print: paged
+    code-overflow: wrap
+  my-assignment-html: default
+execute:
+  warning: false
+  message: false
+csl: harvard-cite-them-right.csl
+bibliography: references.bib
+editor: visual
+---
+
+------------------------------------------------------------------------
+
+```{r}
+#| output: true
+#| eval: true
+library(tidyverse)
+library(rio)
+library(olsrr)
+library(broom)
+library(blorr)
+library(forecast)
+```
+------------------------------------------------------------------------
+
+# Spotify
+
+Data source: 
+
+https://www.kaggle.com/datasets/melissamonfared/spotify-tracks-attributes-and-popularity
+
+
+## Executive summary
+
+This analysis examines how audio features influence song popularity on Spotify. Results show that more danceable and louder tracks tend to be more popular, whereas features such as instrumentalness and energy are associated with lower popularity.
+
+Genre plays an important role. Some relationships, such as the positive effect of danceability and loudness, were consistent across genres, while others, including energy and duration, vary by music type. This suggests that popularity depends not only on audio characteristics but also on genre-specific dynamics.
+
+Overall, audio features provide useful insight but explain only part of popularity, indicating that external factors such as artist recognition or marketing likely play a significant role.
+
+## Introduction
+
+The Spotify Tracks Dataset [https://www.kaggle.com/datasets/melissamonfared/spotify-tracks-attributes-and-popularity] contains 114,000 observations across 21 variables, including track, artist, genre, popularity, and audio features derived from the Spotify API. The dataset appears artificially balanced, with roughly 1,000 observations per genre, although the sampling process is not documented.
+
+The primary objective is to identify which audio variables best explain variation in popularity. A secondary objective is to assess whether these relationships vary by genre.
+
+## Data preparation
+
+Data were inspected and variables grouped into:
+
+-   information variables (excluded),
+-   categorical variables (inspected but not used),
+-   audio variables (numeric predictors),
+-   target variable (popularity)
+
+Observations with zero popularity were removed. Genres were grouped into broader categories (Pop, HipHop, Rock, Metal, Electronic, Classical) based on key terms, excluding unmatched tracks. Tracks may appear multiple times with different genre labels; therefore, observations were collapsed to one row per track to ensure independence and avoid duplication. Where multiple genre assignments existed, a single genre was retained, introducing a simplifying assumption that may not fully capture the multi-genre nature of some tracks. Only the target, genre, and numeric audio variables were retained, with numeric variables standardised.
+
+The final sample size was n = 28,970 observations.
+
+```{r}
+#| eval: true
+#| label: spotify-load-dataset
+spotify <- import("data/dataset.csv")
+```
+
+```{r}
+#| eval: true
+#| label: spotify-str
+
+# Create factors where appropriate
+spotify$track_genre <- as.factor(spotify$track_genre)
+spotify$key <- as.factor(spotify$key)
+spotify$mode <- as.factor(spotify$mode)
+spotify$time_signature <- as.factor(spotify$time_signature)
+
+# Datatypes
+str(spotify)
+```
+
+```{r}
+# create variable groups for easier manipulation
+info_vars <- c(
+  "index", "track_id", "artists",
+  "album_name", "track_name"
+)
+
+other_vars <- c(
+  "explicit", "key", "mode",
+  "time_signature"
+)
+
+audio_vars <- c(
+  "duration_ms", "danceability", "energy",
+  "loudness", "speechiness", "acousticness",
+  "instrumentalness", "liveness",
+  "valence", "tempo"
+)
+
+target <- "popularity"
+```
+
+```{r}
+#| eval: true
+#| label: spotify-distribution
+# Distribution
+summary(spotify[, other_vars])
+summary(spotify[, audio_vars])
+summary(spotify[, target])
+```
+
+```{r}
+#| eval: true
+#| label: spotify-process
+
+spotify <- spotify %>%
+  
+  # 1. Map genres
+  mutate(
+    genre = case_when(
+      track_genre %in% c("pop","k-pop","j-pop","mandopop","cantopop",
+                         "indie-pop","power-pop","synth-pop","pop-film") ~ "Pop",
+
+      track_genre %in% c("hip-hop","r-n-b") ~ "HipHop",
+
+      track_genre %in% c("rock","alt-rock","rock-n-roll","rockabilly",
+                         "hard-rock","psych-rock","alternative","indie",
+                         "grunge","emo","j-rock","punk-rock") ~ "Rock",
+
+      track_genre %in% c("metal","heavy-metal","death-metal",
+                         "black-metal","metalcore") ~ "Metal",
+
+      track_genre %in% c("electronic","electro","edm",
+                         "house","techno","trance",
+                         "dubstep","drum-and-bass","breakbeat","trip-hop") ~ "Electronic",
+
+      track_genre %in% c("classical","opera") ~ "Classical",
+
+      TRUE ~ NA_character_
+    )
+  ) %>%
+
+  # 2. Keep rows with genre identified
+  filter(!is.na(genre), popularity != 0) %>%
+
+  # 3. Collapse to one row per track (to fix duplication)
+  group_by(track_id) %>%
+  slice_head(n = 1) %>%
+  ungroup() %>%
+
+  # Further processing
+  dplyr::select(-all_of(c(info_vars, other_vars))) %>% 
+  mutate(across(all_of(audio_vars), scale)) %>%  
+  dplyr::select(-track_genre)
+```
+
+```{r}
+#| eval: false
+spotify %>%
+  count(track_id) %>%
+  filter(n > 1)
+```
+
+```{r}
+rio::export(spotify, "outputs/spotify_clean.xlsx")
+```
+
+```{r}
+# genre - factor
+spotify$genre <- as.factor(spotify$genre)
+
+# Datatypes - check again
+str(spotify)
+
+# final sample size
+nrow(spotify)
+```
+
+## Part 1 - Global models
+
+### Multiple linear regression models
+
+Three linear models were fitted:
+
+-   lm_no_genre: baseline without genre, only numeric audio variables
+-   lm_main: includes genre
+-   lm_interaction: includes genre interactions
+
+Model performance improves with complexity, with adjusted $R^2$ increasing from approximately 0.09 (no genre) to 0.14 (with genre) and 0.18 (interaction model), (@tbl-spotify-global-models). This indicates that genre contributes meaningfully and that relationships vary across genres, even as overall explanatory power was limited.
+
+```{r}
+#| eval: true
+#| label: spotify-global-lm
+data = spotify
+
+# fit linear models
+lm_no_genre <- lm(popularity ~ . - genre, data = data)
+lm_main <- lm(popularity ~ ., data = data)
+lm_interaction <- lm(popularity ~ . * genre, data = data)
+```
+
+```{r}
+#| label: tbl-spotify-global-models
+#| tbl-cap: "Spotify. Comparison of Global Linear Models"
+no_genre    <- t(glance(lm_no_genre))
+main        <- t(glance(lm_main))
+interaction <- t(glance(lm_interaction))
+
+model_table <- cbind(no_genre, main, interaction)
+
+colnames(model_table) <- c("No Genre", "With Genre", "Interaction")
+
+model_table |>
+  round(3) |>
+  knitr::kable() |>
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### Variable selection
+
+Variable selection methods (`ols_step_backward`, `step`, and `drop1`), retained all predictors except speechiness, and the model was subsequently refitted.
+
+```{r}
+#| eval: true
+#| label: spotify-refit-main-model
+lm_no_genre <- lm(popularity ~ . - genre, data = data)
+lm_no_genre_no_speechiness <- lm(popularity ~ . - genre - speechiness, data = data)
+```
+
+```{r}
+#| eval: true
+#| label: spotify-variable-selection-global
+
+model <- lm_no_genre_no_speechiness
+
+# ols p-value method
+model_ols <- {
+  capture.output(tmp <- ols_step_backward_p(model))
+  tmp
+}
+
+# AIC method
+model_step     <- step(model, direction = "backward", trace = 0)
+
+# drop method
+model_drop <- {
+  capture.output(tmp <- drop1(model, test = "F"))
+  tmp
+}
+
+
+# Extract variables
+attr(terms(model_ols$model), "term.labels")
+attr(terms(model_step), "term.labels")
+model_drop[!is.na(model_drop[, "Pr(>F)"]) &
+           model_drop[, "Pr(>F)"] < 0.05, ]
+
+```
+
+### Main effects
+
+To ensure interpretability, analysis focuses on the no genre model, using numerical predictors only. The coefficient plot (@fig-spotify-coefficient-plot) shows that loudness and danceability have strong positive effects, whereas energy and instrumentalness have strong negative effects. Other variables have weaker negative effects.
+
+```{r}
+#| eval: true
+#| label: fig-spotify-coefficient-plot
+#| fig-cap: "Spotify. Plot of the main effects coefficients"
+tidy(model, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  filter(term != "genre") %>%   
+  ggplot(aes(x = estimate, y = reorder(term, estimate))) +
+  geom_point(colour = "steelblue") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.3) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "red") +
+  theme_bw() +
+  theme(axis.text.y = element_text(size = 7)) +
+  labs(title = "Coefficient Plot (Main Effects Model)",
+       x = "Estimate", y = NULL)
+
+```
+
+ANOVA results (@tbl-spotify-anova-table, @fig-spotify-anova-plot) confirm this, with loudness and danceability having the largest F statistics, indicating the greatest explanatory power. Acousticness and tempo contribute minimally relative to other variables.
+
+```{r}
+#| eval: true
+#| label: fig-spotify-anova-plot
+#| fig-cap: "Spotify. Plot of F-statistics from ANOVA table"
+
+tidy(anova(model)) %>%
+  filter(term != "Residuals") %>%
+  ggplot(aes(x = statistic, 
+             y = reorder(term, statistic))) +
+  geom_col(fill = "steelblue") +
+  labs(title = "F-statistics from ANOVA table",
+       x = "F statistic", 
+       y = NULL) +
+  theme_bw()
+```
+
+```{r}
+#| eval: true
+#| label: tbl-spotify-anova-table
+#| tbl-cap: "Spotify. ANOVA table"
+anova_model <- anova(model) |>  
+  knitr::kable(digits = 3)
+
+anova_model
+```
+
+### Diagnostics
+
+Diagnostics (@fig-spotify-diagnostics-plot) indicate violations of normality and homoscedasticity. However, given the large sample size, these do not materially affect estimates, and the model is retained for interpretation rather than strict inference.
+
+```{r}
+#| label: fig-spotify-diagnostics-plot
+#| fig-cap: "Spotify. Diagnostic plots"
+#| fig-height: 6
+par(mfrow = c(2, 2))
+plot(model)
+```
+
+## Part 2 - Genre-specific models
+
+### Model estimation
+
+The data were split into genre-specific subsets, and seperate models fitted. Variable selection using `drop1`() was applied, and models were refitted using retained predictors.
+
+Genre-specific models reveal both consistent and varying relationships (@fig-spotify-bar-plot). Danceability is positively associated with popularity across all genres (except not retained in HipHop), while liveness and valence (excl. Metal) were consistently negative. Loudness is positive in most genres but negative for Classical. These results align broadly with the no genre model (@fig-spotify-coefficient-plot).
+
+In contrast, energy, instrumentalness, and duration vary in both magnitude and direction, indicating strong genre dependence and important heterogeneity.
+
+```{r}
+#| eval: true
+
+# genre sample size (n)
+summary(spotify$genre)
+
+# split into subsets
+groups <- split(spotify, spotify$genre)
+
+for (i in seq_along(groups)) {
+  assign(paste0("genre_", i), groups[[i]])
+}
+
+# name subsets, drop genre
+Classical  <- dplyr::select(groups[[1]], -genre) 
+Electronic <- dplyr::select(groups[[2]], -genre) 
+HipHop     <- dplyr::select(groups[[3]], -genre) 
+Metal      <- dplyr::select(groups[[4]], -genre) 
+Pop        <- dplyr::select(groups[[5]], -genre) 
+Rock       <- dplyr::select(groups[[6]], -genre) 
+
+# check subset dimensions
+dim(Classical) # Classical (n=1421)
+dim(Electronic) # Electronic (n=7508)
+dim(HipHop) # HipHop (n=1402)
+dim(Metal) # Metal (n=3927)
+dim(Pop) # Pop (n=7213)
+dim(Rock) # Rock (n=7499)
+```
+
+```{r}
+run_genre_model <- function(data) {
+  
+  # 1. Fit full model (no genre inside subset)
+  model_full <- lm(popularity ~ ., data = data)
+  
+  # 2. Variable selection using drop1
+  drop_tbl <- drop1(model_full, test = "F")
+
+  # Convert to data frame for easier handling
+  drop_df <- as.data.frame(drop_tbl)
+  
+  # Keep variables that are significant
+  keep_vars <- rownames(drop_df)[
+    !is.na(drop_df$`Pr(>F)`) & drop_df$`Pr(>F)` < 0.05
+  ]
+  
+  # Remove "<none>" if present
+  keep_vars <- setdiff(keep_vars, "<none>")
+  
+  # 3. Refit model with selected variables
+  formula_new <- as.formula(
+    paste("popularity ~", paste(keep_vars, collapse = " + "))
+  )
+  
+  model_final <- lm(formula_new, data = data)
+  
+  # 4. Return everything useful
+  list(
+    full_model = model_full,
+    selected_vars = keep_vars,
+    final_model = model_final
+  )
+}
+```
+
+```{r}
+res_classical  <- run_genre_model(Classical)
+res_pop        <- run_genre_model(Pop)
+res_rock       <- run_genre_model(Rock)
+res_metal      <- run_genre_model(Metal)
+res_hiphop     <- run_genre_model(HipHop)
+res_electronic <- run_genre_model(Electronic)
+
+# extract coefficients from each model
+extract_coefs <- function(res, genre_name) {
+  coefs <- summary(res$final_model)$coefficients
+  df <- as.data.frame(coefs)
+  df$Variable <- rownames(df)
+  df$Genre <- genre_name
+  df
+}
+
+# combine 
+coef_all <- rbind(
+  extract_coefs(res_classical, "Classical"),
+  extract_coefs(res_pop, "Pop"),
+  extract_coefs(res_rock, "Rock"),
+  extract_coefs(res_metal, "Metal"),
+  extract_coefs(res_hiphop, "HipHop"),
+  extract_coefs(res_electronic, "Electronic")
+)
+```
+
+```{r}
+#| label: fig-spotify-bar-plot
+#| fig-cap: "Spotify. Bar plots of coefficients by genre and audio variable"
+#| fig-height: 6 
+# plot
+ggplot(coef_all[coef_all$Variable != "(Intercept)", ],
+       aes(x = Genre, y = Estimate, fill = Genre)) +
+  geom_col() +
+  facet_wrap(~ Variable, scales = "free_y") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)
+  ) +
+  labs(title = "Variation in Coefficients by Genre",
+       x = NULL, y = "Estimate")
+```
+
+### Cross validation
+
+Cross-validation evaluates predictive performance (@tbl-spotify-cv-all.), where lower values indicate better generalisation. Although genre-specific models have lower $R^2$, some achieve lower CV errors, suggesting improved prediction within genres. This highlights a trade-off between explanatory power and predictive accuracy.
+
+```{r}
+#| eval: true
+compare_models_cv <- function(...) {
+  models <- list(...)
+  
+  map_dfr(
+    models,
+    CV,
+    .id = "model"
+  ) |>  
+  knitr::kable(digits = 3)
+}
+```
+
+```{r}
+#| eval: true
+#| label: tbl-spotify-cv-all
+#| tbl-cap: "Spotify. CV summary table"
+compare_models_cv(
+  No_Genre             = lm_no_genre,
+  No_Genre_Speechiness = lm_no_genre_no_speechiness,
+  With_Genre           = lm_main,
+  Genre_Interaction    = lm_interaction,
+  Pop                  = res_pop$final_model,
+  Rock                 = res_rock$final_model,
+  HipHop               = res_hiphop$final_model,
+  Metal                = res_metal$final_model,
+  Electronic           = res_electronic$final_model,
+  Classical            = res_classical$final_model
+)
+```
+
+## Conclusions
+
+### Global model
+
+Including genre improves model performance, with the adjusted $R^2$ accuracy increasing from approximately 0.09 to 0.18. Coefficient analysis shows that loudness and danceability have strong positive effects, whereas energy and instrumentalness have negative effects. ANOVA results confirm that loudness and danceability are the most important predictors. Despite this, overall explanatory power remains limited. Diagnostic checks indicate some assumption violations, but these are not critical given the large sample size.
+
+### Genre-specific models
+
+Genre-specific models show both stable and varying effects. Danceability is consistently positive and liveness and valence consistently negative, while loudness positive in most genres indicating robust relationships. Other variables, including energy, instrumentalness, and duration, vary substantially, confirming that their effects depend on genre.
+
+### Limitations
+
+The dataset appears artificially balanced across genres and does not include external factors such as artist popularity or marketing, limiting explanatory power. Some violations of model assumptions were observed, although these are mitigated by the large sample size. Additionally, grouping genres into broader categories may mask variation within subgenres. Tracks may also be associated with multiple genre labels in the original dataset; collapsing these to a single genre per track introduces a simplifying assumption that may not fully reflect the multi‑genre nature of some songs.
+
+------------------------------------------------------------------------
+
